@@ -228,3 +228,331 @@ impl Default for Sequencer<SystemClock> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU8;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc,
+    };
+    use std::thread::sleep;
+
+    #[test]
+    fn set_tempo() {
+        let tempo = NonZeroU8::new(60).unwrap(); // bpm
+        let sequencer = Sequencer::new().with_tempo(tempo).build();
+        let period = sequencer.clock.borrow().get_period();
+        assert_eq!(period, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn count_steps() {
+        let count = 20;
+        let tempo = NonZeroU8::new(150).unwrap(); // bpm
+        let period = Duration::from_millis(100);
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = x.clone();
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |_, _| {
+                let _ = y.fetch_add(1, SeqCst);
+            })
+            .build();
+        sequencer.start();
+        sleep(count * period - period / 2);
+        sequencer.pause();
+        assert_eq!(
+            (u4::try_from(3 as u8).unwrap(), count as usize),
+            sequencer.get_steps()
+        ); // should be on step (count - 1) % 16 after count total step events
+        assert_eq!(count as usize, x.load(SeqCst)); // and count on_step() callbacks
+    }
+
+    #[test]
+    fn add_notes() {
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = x.clone();
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |step, events| {
+                for event in events {
+                    if let Event::NoteOn {
+                        channel,
+                        pitch,
+                        velocity,
+                    } = event
+                    {
+                        assert_eq!(usize::from(channel) + step, usize::from(pitch));
+                        let _ = y.fetch_add(1, SeqCst);
+                        let _ = velocity; // silence unused variable warning
+                    }
+                }
+            })
+            .build();
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                sequencer.add_note(
+                    u2::try_from(track).unwrap(),
+                    u4::try_from(step).unwrap(),
+                    Note::from_pitch(u7::try_from(track + step).unwrap()), // pitch value = track + step
+                );
+            }
+        }
+        sequencer.start();
+        sleep(Sequencer::STEPS as u32 * period - period / 2);
+        sequencer.pause();
+        assert_eq!(Sequencer::TRACKS * Sequencer::STEPS, x.load(SeqCst));
+    }
+
+    #[test]
+    fn remove_notes() {
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |_, events| {
+                assert_eq!(true, events.is_empty());
+            })
+            .build();
+        let mut i: u8 = 0; // add notes
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                sequencer.add_note(
+                    u2::try_from(track).unwrap(),
+                    u4::try_from(step).unwrap(),
+                    Note::from_pitch(u7::try_from(i).unwrap()),
+                );
+                i += 1;
+            }
+        }
+        i = 0; // remove notes
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                sequencer.delete_note(
+                    u2::try_from(track).unwrap(),
+                    u4::try_from(step).unwrap(),
+                    Note::from_pitch(u7::try_from(i).unwrap()),
+                );
+                i += 1;
+            }
+        }
+        sequencer.start();
+        sleep(Sequencer::STEPS as u32 * period - period / 2);
+        sequencer.pause();
+    }
+
+    #[test]
+    fn note_offs() {
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = x.clone();
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |step, events| {
+                for event in events {
+                    if let Event::NoteOff { channel, pitch } = event {
+                        let _ = channel;
+                        let pitch = u8::from(pitch) as i32;
+                        let duration = (step as i32 - pitch).rem_euclid(Sequencer::STEPS as i32);
+                        assert_eq!(duration, pitch);
+                        let _ = y.fetch_add(1, SeqCst);
+                    }
+                }
+            })
+            .build();
+        // add note_ons
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                sequencer.add_note(
+                    u2::try_from(track).unwrap(),
+                    u4::try_from(step).unwrap(),
+                    Note {
+                        pitch: u7::try_from(step).unwrap(), // pitch value = current step
+                        velocity: u7::ZERO,
+                        duration: u4::try_from(step).unwrap(), // duration = current step
+                    },
+                );
+            }
+        }
+        sequencer.start();
+        sleep(2 * Sequencer::STEPS as u32 * period - period / 2);
+        sequencer.pause();
+        assert_eq!(3 * Sequencer::TRACKS * Sequencer::STEPS / 2, x.load(SeqCst));
+    }
+
+    #[test]
+    fn add_params() {
+        let controllers = [
+            Controller::Modulation,
+            Controller::Breath,
+            Controller::Volume,
+            Controller::Pan,
+        ];
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = x.clone();
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |step, events| {
+                let mut bitfield: u8 = 0;
+                for event in events {
+                    if let Event::ControllerChange {
+                        channel,
+                        controller,
+                        value,
+                    } = event
+                    {
+                        assert_eq!(usize::from(channel) + step, usize::from(value));
+                        let _ = y.fetch_add(1, SeqCst);
+                        match u8::from(controller) {
+                            1 => bitfield |= 0x1,  // modulation
+                            2 => bitfield |= 0x2,  // breath
+                            7 => bitfield |= 0x4,  // volume
+                            10 => bitfield |= 0x8, // pan
+                            _ => panic!("invalid controller number"),
+                        }
+                    }
+                }
+                assert_eq!(bitfield, 0xF);
+            })
+            .build();
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                for controller in &controllers {
+                    sequencer.set_param(
+                        u2::try_from(track).unwrap(),
+                        u4::try_from(step).unwrap(),
+                        Param {
+                            controller: *controller,
+                            value: u7::try_from(track + step).unwrap(),
+                        },
+                    );
+                }
+            }
+        }
+        sequencer.start();
+        sleep(Sequencer::STEPS as u32 * period - period / 2);
+        sequencer.pause();
+        assert_eq!(
+            Sequencer::TRACKS * Sequencer::STEPS * controllers.len(),
+            x.load(SeqCst)
+        );
+    }
+
+    #[test]
+    fn remove_params() {
+        let controllers = [
+            Controller::Modulation,
+            Controller::Breath,
+            Controller::Volume,
+            Controller::Pan,
+        ];
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |_, events| {
+                assert_eq!(true, events.is_empty());
+            })
+            .build();
+
+        // add params
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                for controller in &controllers {
+                    sequencer.set_param(
+                        u2::try_from(track).unwrap(),
+                        u4::try_from(step).unwrap(),
+                        Param::from_controller(*controller),
+                    );
+                }
+            }
+        }
+        // remove params
+        for track in 0..Sequencer::TRACKS {
+            for step in 0..Sequencer::STEPS {
+                for controller in &controllers {
+                    sequencer.clear_param(
+                        u2::try_from(track).unwrap(),
+                        u4::try_from(step).unwrap(),
+                        Param::from_controller(*controller),
+                    );
+                }
+            }
+        }
+        sequencer.start();
+        sleep(Sequencer::STEPS as u32 * period - period / 2);
+        sequencer.pause();
+    }
+
+    #[test]
+    fn pause_start() {
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let mut sequencer = Sequencer::new().with_tempo(tempo).build();
+        sequencer.start();
+        sleep(3 * period / 2);
+        sequencer.pause();
+        let last_step = sequencer.get_steps().0;
+        sequencer.on_step(move |step, _| assert_eq!(last_step, u4::try_from(step - 1).unwrap()));
+        sequencer.start();
+        sleep(period / 2);
+        sequencer.pause();
+    }
+
+    #[test]
+    fn while_running() {
+        let tempo = NonZeroU8::new(250).unwrap();
+        let period = Duration::from_millis(60);
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = x.clone();
+        let mut sequencer = Sequencer::new()
+            .with_tempo(tempo)
+            .on_step(move |step, events| {
+                for event in events {
+                    if let Event::NoteOn {
+                        channel,
+                        pitch,
+                        velocity,
+                    } = event
+                    {
+                        let _ = channel;
+                        assert_eq!(usize::from(pitch), step);
+                        assert_eq!(usize::from(velocity), y.fetch_add(1, SeqCst));
+                    }
+                }
+            })
+            .build();
+        sequencer.start();
+        sleep(period / 2);
+        for i in 0..u7::MAX {
+            let step =
+                u4::try_from((u8::from(sequencer.get_steps().0) + 1) % Sequencer::STEPS as u8)
+                    .unwrap();
+            println!(
+                "sent step {} pitch {} velocity {}",
+                u8::from(step),
+                u8::from(step),
+                i
+            );
+            sequencer.add_note(
+                u2::ZERO,
+                step,
+                Note {
+                    pitch: u7::try_from(u8::from(step)).unwrap(),
+                    velocity: u7::try_from(i).unwrap(),
+                    duration: u4::ZERO,
+                },
+            );
+            sleep(period);
+        }
+        sequencer.pause();
+        assert_eq!(u7::MAX as usize, x.load(SeqCst))
+    }
+}
