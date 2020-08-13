@@ -285,3 +285,112 @@ fn parse_controller(arg: Option<&str>) -> Result<Controller, &'static str> {
         Err("missing argument")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn good_tempo() {
+        for i in 1..u8::MAX {
+            let string = format!("{}", i);
+            let tempo = parse_tempo(Some(string)).unwrap();
+            assert_eq!(u8::from(tempo), i);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn none_tempo() {
+        parse_tempo(None).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn zero_tempo() {
+        parse_tempo(Some("0".to_string())).unwrap();
+    }
+
+    #[test]
+    fn good_u2() {
+        for i in 0..u2::MAX {
+            let string = format!("{}", i);
+            let int = parse_int::<u2>(Some(&string)).unwrap();
+            assert_eq!(u8::from(int), i);
+        }
+    }
+
+    #[test]
+    fn good_u4() {
+        for i in 0..u4::MAX {
+            let string = format!("{}", i);
+            let int = parse_int::<u4>(Some(&string)).unwrap();
+            assert_eq!(u8::from(int), i);
+        }
+    }
+
+    #[test]
+    fn good_u7() {
+        for i in 0..u7::MAX {
+            let string = format!("{}", i);
+            let int = parse_int::<u7>(Some(&string)).unwrap();
+            assert_eq!(u8::from(int), i);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn none_u2() {
+        parse_int::<u2>(None).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn none_u4() {
+        parse_int::<u4>(None).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn none_u7() {
+        parse_int::<u7>(None).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_u2() {
+        parse_int::<u2>(Some("4")).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_u4() {
+        parse_int::<u4>(Some("16")).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_u7() {
+        parse_int::<u7>(Some("128")).unwrap();
+    }
+
+    #[test]
+    fn good_controller() {
+        assert_eq!(Ok(Controller::Modulation), parse_controller(Some("mod")));
+        assert_eq!(Ok(Controller::Breath), parse_controller(Some("breath")));
+        assert_eq!(Ok(Controller::Volume), parse_controller(Some("vol")));
+        assert_eq!(Ok(Controller::Pan), parse_controller(Some("pan")));
+    }
+
+    #[test]
+    #[should_panic]
+    fn none_controller() {
+        parse_controller(None).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_controller() {
+        parse_controller(Some("modulation")).unwrap();
+    }
+}
